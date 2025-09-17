@@ -381,4 +381,157 @@ if window_days == 7:
                 use_container_width=True,
             )
 
+
+# ==================== Analyst Tabs: Premium, Velocity, Exposure, Creators, Watchlist ====================
+with st.expander("Analyst modules", expanded=True):
+    tabs = st.tabs([
+        "Engagement Premium", "Velocity & Half-life", "Exposure breadth & concentration",
+        "New vs returning creators", "Watchlist flags"
+    ])
+
+    # 1) Engagement Premium (quality of buzz in current window)
+    with tabs[0]:
+        w = (panel_T.groupby("brand", as_index=False)
+             .agg(views=("views","sum"), likes=("likes","sum"), comments=("comments","sum"), mentions=("video_mentions","sum")))
+        if w.empty:
+            st.info("No data for the current window.")
+        else:
+            for c in ["views","likes","comments","mentions"]:
+                w[c] = pd.to_numeric(w[c], errors="coerce").fillna(0)
+            w["epm"] = (w["views"] + w["likes"] + w["comments"]) / w["mentions"].replace(0, np.nan)
+            baseline = w["epm"].median()
+            w["epi"] = w["epm"] / (baseline if baseline and not np.isnan(baseline) else 1)
+            w = w.sort_values("epi", ascending=False)
+            fig_epi = px.bar(w[w["brand"].isin(selected_brands)], x="brand", y="epi",
+                              title="Engagement Premium Index (vs median in this window)")
+            fig_epi.update_layout(yaxis_title="Index (1.0 = median)")
+            st.plotly_chart(fig_epi, use_container_width=True)
+            st.dataframe(w.round({"epm":2, "epi":2}), use_container_width=True)
+            st.caption("EPI = Engagement per mention / median across brands in the current [T-6..T] window.")
+
+    # 2) Velocity & Half-life (uses registry + per-video daily stats)
+    with tabs[1]:
+        try:
+            reg = pd.read_csv(find_file("yt_video_registry.csv"), parse_dates=["published_at_utc"])  # video_id, brand, channel_id, published_at_utc, ...
+            stat = pd.read_csv(find_file("yt_video_stats_daily.csv"), parse_dates=["as_of_date_utc"])  # video_id, as_of_date_utc, viewCount, likeCount, commentCount
+        except FileNotFoundError:
+            st.info("Per-video registry/stats not found.")
+        else:
+            reg["pub_date"] = reg["published_at_utc"].dt.floor("D")
+            # videos in the current publish window for selected brands
+            cohort = reg[(reg["pub_date"].between(min_d.floor("D"), max_d.floor("D"))) & (reg["brand"].isin(selected_brands))][["video_id","brand","pub_date","published_at_utc"]]
+            if cohort.empty:
+                st.info("No videos in the current window for the selected brands.")
+            else:
+                stat = stat.merge(cohort, on="video_id", how="inner")
+                stat["age_days"] = (stat["as_of_date_utc"].dt.floor("D") - stat["published_at_utc"].dt.floor("D")).dt.days
+                for c in ["viewCount","likeCount","commentCount"]:
+                    stat[c] = pd.to_numeric(stat[c], errors="coerce").fillna(0)
+                # Velocity: median views by age 0..7 per brand
+                vel = (stat.groupby(["brand","age_days"], as_index=False)["viewCount"].median()
+                            .query("age_days >= 0 & age_days <= 7"))
+                if vel.empty:
+                    st.info("Not enough as-of snapshots to compute velocity.")
+                else:
+                    fig_vel = px.line(vel, x="age_days", y="viewCount", color="brand", markers=True,
+                                      title="Median views by age (0–7 days since publish)")
+                    fig_vel.update_layout(xaxis_title="Days since publish", yaxis_title="Median views")
+                    st.plotly_chart(fig_vel, use_container_width=True)
+                # Half-life per video, then median by brand
+                vv = (stat.groupby(["brand","video_id","age_days"], as_index=False)["viewCount"].sum()
+                        .sort_values(["brand","video_id","age_days"]))
+                out_rows = []
+                for (b, vid), g in vv.groupby(["brand","video_id"]):
+                    if g.empty:
+                        continue
+                    total = g["viewCount"].sum()
+                    if total <= 0:
+                        continue
+                    g = g.reset_index(drop=True)
+                    g["cum"] = g["viewCount"].cumsum()
+                    g["cum_share"] = g["cum"] / total
+                    hit = g[g["cum_share"] >= 0.5]
+                    hl = hit["age_days"].iloc[0] if not hit.empty else np.nan
+                    out_rows.append({"brand": b, "video_id": vid, "half_life_days": hl})
+                if out_rows:
+                    hl_df = pd.DataFrame(out_rows)
+                    brand_hl = hl_df.groupby("brand", as_index=False)["half_life_days"].median().sort_values("half_life_days")
+                    st.dataframe(brand_hl, use_container_width=True)
+                    st.caption("Half-life = median days for a brand’s cohort to reach 50% of cumulative views.")
+                else:
+                    st.info("Could not compute half-life for this window.")
+
+    # 3) Exposure breadth & concentration (from registry in window)
+    with tabs[2]:
+        try:
+            reg = pd.read_csv(find_file("yt_video_registry.csv"), parse_dates=["published_at_utc"])  # includes channel_id
+        except FileNotFoundError:
+            st.info("Registry not found.")
+        else:
+            reg["pub_date"] = reg["published_at_utc"].dt.floor("D")
+            r = reg[(reg["pub_date"].between(min_d.floor("D"), max_d.floor("D"))) & (reg["brand"].isin(selected_brands))]
+            if r.empty:
+                st.info("No registry rows for the current window.")
+            else:
+                breadth = r.groupby("brand", as_index=False)["channel_id"].nunique().rename(columns={"channel_id":"unique_channels"})
+                ch_counts = r.groupby(["brand","channel_id"], as_index=False)["video_id"].nunique().rename(columns={"video_id":"videos"})
+                tot = ch_counts.groupby("brand", as_index=False)["videos"].sum().rename(columns={"videos":"tot"})
+                m = ch_counts.merge(tot, on="brand", how="left")
+                m["share"] = np.where(m["tot"]>0, m["videos"]/m["tot"], 0.0)
+                hhi = m.groupby("brand", as_index=False)["share"].apply(lambda s: (s**2).sum()).rename(columns={"share":"hhi_by_mentions"})
+                out = breadth.merge(hhi, on="brand", how="left").sort_values(["unique_channels","hhi_by_mentions"], ascending=[False, True])
+                st.dataframe(out, use_container_width=True)
+                st.caption("Breadth = unique channels in [T-6..T]. HHI (by mentions): higher = more dependent on few creators.")
+
+    # 4) New vs returning creators (vs prior N days)
+    with tabs[3]:
+        LOOKBACK_DAYS = 60
+        try:
+            reg = pd.read_csv(find_file("yt_video_registry.csv"), parse_dates=["published_at_utc"])  # brand, channel_id
+        except FileNotFoundError:
+            st.info("Registry not found.")
+        else:
+            reg["pub_date"] = reg["published_at_utc"].dt.floor("D")
+            cur = reg[(reg["pub_date"].between(min_d.floor("D"), max_d.floor("D"))) & (reg["brand"].isin(selected_brands))]
+            prev = reg[(reg["pub_date"] < min_d.floor("D")) & (reg["pub_date"] >= min_d.floor("D") - pd.Timedelta(days=LOOKBACK_DAYS))]
+            seen_before = set(zip(prev["brand"], prev["channel_id"]))
+            pairs = cur[["brand","channel_id"]].drop_duplicates().copy()
+            pairs["new_creator"] = ~pairs.apply(lambda r: (r["brand"], r["channel_id"]) in seen_before, axis=1)
+            rate = (pairs.groupby("brand")["new_creator"].mean()
+                          .rename("share_new_creators").reset_index()
+                          .sort_values("share_new_creators", ascending=False))
+            st.dataframe(rate, use_container_width=True)
+            st.caption(f"Share of channels in [T-6..T] that did not mention the brand in the prior {LOOKBACK_DAYS} days.")
+
+    # 5) Watchlist flags (breakouts & streaks on roll-7)
+    with tabs[4]:
+        r7_T = roll7[roll7["report_date_utc"].dt.date == sel_asof].copy()
+        if r7_T.empty:
+            st.info("No roll-7 rows for this as_of date.")
+        else:
+            sc = r7_T[["brand","roll7_views"]].copy()
+            sc["roll7_views"] = pd.to_numeric(sc["roll7_views"], errors="coerce").fillna(0)
+            mu, sd = sc["roll7_views"].mean(), sc["roll7_views"].std()
+            sd = sd if sd and not np.isnan(sd) else 1.0
+            sc["z"] = (sc["roll7_views"] - mu) / sd
+            breakout = sc[(sc["z"] >= 2) & (sc["brand"].isin(selected_brands))].sort_values("z", ascending=False)
+
+            rsub = roll7[roll7["brand"].isin(selected_brands)].sort_values(["brand","report_date_utc"]).copy()
+            rsub["chg"] = rsub.groupby("brand")["roll7_views"].diff()
+            # rolling 3-day count of positive changes per brand; align index back to rsub
+            pos = (rsub["chg"] > 0)
+            streak = (
+                pos.groupby(rsub["brand"])  # group by brand preserving original index order
+                   .apply(lambda s: s.rolling(3, min_periods=3).sum())
+                   .reset_index(level=0, drop=True)
+            )
+            rsub["streak_up"] = streak.fillna(0)
+            sustained = rsub[(rsub["report_date_utc"].dt.date == sel_asof) & (rsub["streak_up"] >= 3)]
+
+            st.markdown("**Breakout (z≥2 on roll-7 views):**")
+            st.dataframe(breakout[["brand","roll7_views","z"]].round(2), use_container_width=True)
+            st.markdown("**Sustained growth (≥3 consecutive increases in roll-7 views):**")
+            st.dataframe(sustained[["brand","report_date_utc","roll7_views"]], use_container_width=True)
+            st.caption("Flags surface unusual attention regimes to investigate (events, campaigns, product drops). Not investment advice.")
+
 st.caption("Data: yt_brand_daily_panel.csv (Rolling-1) and yt_brand_roll7_daily.csv (Rolling-2). All timestamps UTC.")
